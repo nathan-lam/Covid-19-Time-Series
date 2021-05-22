@@ -1,0 +1,600 @@
+---
+title: "Forecasting the number of Covid Cases"
+author: "Nathan Lam"
+date: ""
+output: 
+        bookdown::pdf_document2: 
+                toc: false
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r, include=FALSE,results='hide'}
+library(tikzDevice)
+library(latex2exp)
+library(astsa)
+library(forecast)
+
+
+#####functions used
+#pgram has been modified
+pgram = function(x,title=''){
+  m = floor(length(x)/2)
+  pgram = abs(fft(x)[2:(m+1)])^2/length(x)
+  fft_info <- list(fft = pgram,max = which.max(pgram[1:m]))
+  plot(fft_info$fft, type = "h",main=title)
+  abline(h=0)
+  return(fft_info)
+}
+
+
+arma_bootstrap <- function(n,h,p,d=0,q,P=NULL,D=0,Q=NULL,S=NULL){
+  #n = how many times to bootstrap
+  #h = how many lags out for ACF, PACF 
+  #p,d,q,P,D,Q are real numbers
+  
+  acf_matrix <- NULL
+  pacf_matrix <- NULL
+  for(i in 1:n){
+    gen <- sarima.sim(ar=p,d=d,ma=q,sar=P,D=D,sma=Q,S=S)
+
+    acf_matrix <- rbind(acf_matrix, acf2(gen,max.lag=h,plot=FALSE)[,'ACF'])
+    pacf_matrix <- rbind(pacf_matrix, acf2(gen,max.lag=h,plot=FALSE)[,'PACF'])
+  }
+  sorted_acf <- apply(acf_matrix,2,sort)
+  sorted_pacf <- apply(pacf_matrix,2,sort)
+  
+  
+  acf_CI <- rbind(sorted_acf[nrow(sorted_acf)*0.025,],
+                  colMeans(acf_matrix),
+                  sorted_acf[nrow(sorted_acf)*0.975,])
+  
+  pacf_CI <- rbind(sorted_pacf[nrow(sorted_pacf)*0.025,],
+                  colMeans(pacf_matrix),
+                  sorted_pacf[nrow(sorted_pacf)*0.975,])
+  
+  rownames(acf_CI)<-c('Lower','Mean','Upper')
+  rownames(pacf_CI)<-c('Lower','Mean','Upper')
+    
+  
+  return(list('ACF'=acf_CI,'PACF'=pacf_CI))
+}
+
+
+fitted_diff <- function(X,Y,n){
+  #function for a specfici differencing prediction
+  #X is data before differencing
+  #Y is data after differencing, function expects already to be differences
+  #n is how many points out (for forecasting)
+  EY <- mean(Y)
+  fitted <- X[1:8]
+  
+  #this differencing takes 10 points into the past
+  for(i in 9:(length(X)+n)){
+    fitted <- c(fitted, X[i-1] +
+                        X[i-7] -
+                        X[i-8] + EY)
+
+  }
+  return(fitted)
+}
+
+smooth_pred <- function(weights,unfiltered,start,end){
+  added_filter <- weights %*% unfiltered[start:end]
+  return(added_filter)
+}
+
+```
+
+
+# Executive Summary  
+The current events of the global pandemic continues to affect Gotham City. During the months between March 2020 and January 2021, Covid-19 was extremely infectious. There are different waves and peaks of the number of cases and we want to be able to model the number of cases so we can have a reasonable estimate to account for future cases. The forecast is made using Weekly Differencing + Daily Differencing + ARMA(1,2)x(1,1)[7] and it predicts that the number of new cases will continue to show seasonality but the local trend will flatten in the next 10 days. 
+
+# Exploratory Data Analysis  
+The number of covid cases shown on the left in Figure 1 looks to be composed of a big wave made out of smaller waves, there is at least two dominant frequencies in this process. The effects of seasonality also appears to increase over time which implies the variance of the process is changing. The process of the data in the beginning is very different to the process at the end, and you can see this between May and June where the size of the waves changes from from an exponential growth.  
+```{r, echo=F, fig.align='center',fig.width=8, fig.height=3, fig.cap = "On the left, plot of raw time series for cases. On the right, plot of time series for cases after an exponential filter and log transformation. The time axis on both plots are marked by month and year."}
+covid <- read.csv('data_covid.csv',header=T)
+cases <- covid$cases
+tt <- covid$ID
+dates<-as.Date(covid$date, format="%m/%d/%y")
+par(mfrow=c(1,2))
+plot(dates,covid$cases,main ="Time series of Covid Cases", xaxt="n",type='l', 
+     xlab="", ylab="Cases")
+axis.Date(1, at = seq(min(dates), max(dates), by = "month"),
+          format = "%m/%y", las = 1)
+months <- format(dates,"%B")
+
+q <- 30
+a <- .9
+weights <- rev(a^1:q)
+weights <- weights/sum(weights)
+f_cases <- stats::filter(cases,side=1,filter=weights) 
+#removing Na at the start from filtering
+f_cases <- na.omit(f_cases)
+f_tt <- tt[-1:-(q-1)]
+f_dates <- dates[-1:-(q-1)]
+
+
+plot.ts(f_dates,log(f_cases),main='Transformed Time series \n of Covid Cases', xaxt="n",type='l', 
+     xlab="", ylab="Transformed Cases")
+axis.Date(1, at = seq(min(f_dates), max(f_dates), by = "months"), format = "%m/%y", las = 1)
+
+```
+ 
+
+In addition to the seasonality, there is also an trend line, possibly a polynomial trend, but it is apparent that cases is increasing over time. An ideal trend would have their slope approach 0, signaling the rate of spread is decreasing.  
+
+To help remedy the erratic behavior, we will transform and smooth the data. Using an exponential smoother and log transformation, we produce the right plot in Figure 1. The general shape is still preserved, which is what we want for out predictions. The trend made by the data is not as obstructed by the high variance before filtering, and after filtering, it appears maybe a cubic model could possibly fit. The process of filtering also removes some data points and the filter used truncates the data by 30 data points, which is why the start of the data will be different from plots without filtering. When the number of new covid cases is mentioned as a variable, it will be referred to as 'Cases' and will be in reference to after a filter has been applied.  
+  
+  
+  
+  
+  
+# Models Considered  
+The two models being considered is a parametric model and a differencing model. After fitting both models, a SARIMA model will be fitted to each to achieve white noise.  
+  
+  
+## Parametric Model  
+The parametric model utilizes polynomials, an indicator, and sinusoids variables. The polynomial is meant to capture the almost cubic shape of the time series, an indicator is added to capture some seasonality in the weekly spikes, and five sinusoids are added to capture the remaining frequencies not captured by the indicator variable. The parametric signal model is mathematically described in Equation \@ref(eq:parm).  
+  
+```{r parametric, include = F,execute=F, echo=F, fig.align='center',fig.width=7, fig.height=3, fig.cap = "On the left, parametric model fitted in blue on the transformed data in black. On the right, plot of residual of the parametric model"}
+f <- c(3,4,5,39,15)/length(f_cases)
+para_mod1 <- lm(log(f_cases) ~ poly(f_tt,5) + 
+                  (cos(2*pi*f[1]*f_tt) + sin(2*pi*f[1]*f_tt)) + 
+                  (cos(2*pi*f[2]*f_tt) + sin(2*pi*f[2]*f_tt)) + 
+                  (cos(2*pi*f[3]*f_tt) + sin(2*pi*f[3]*f_tt)) + 
+                  (cos(2*pi*f[4]*f_tt) + sin(2*pi*f[4]*f_tt)) + 
+                  (cos(2*pi*f[5]*f_tt) + sin(2*pi*f[5]*f_tt)))
+
+
+par(mfrow=c(1,2))
+plot(f_dates,log(f_cases),main='Parametric Model', xaxt="n",type='l', 
+     xlab="", ylab="Transformed Cases")
+lines(f_dates,para_mod1$fitted.values,col='blue',type='l')
+axis.Date(1, at = seq(min(f_dates), max(f_dates), by = "month"),
+          format = "%b-%Y", las = 2)
+
+
+
+
+plot.ts(f_dates,para_mod1$residuals,main="Parametric Residual plot", xaxt="n",type='l', 
+     xlab="",ylab='Residuals')
+axis.Date(1, at = seq(min(f_dates), max(f_dates), by = "month"),
+          format = "%b-%Y", las = 2)
+#freq_para1 <- pgram(para_mod1$residuals)
+
+
+```
+
+```{r, echo=F, fig.align='center',fig.width=7, fig.height=3, fig.cap = "On the left, parametric model fitted in blue on the transformed data in black. On the right, plot of residual of the parametric model. The time axis on both plots are marked by month and year."}
+day <- 1:length(f_tt) %% 7 #indicator for day of the week
+f <- c(1/96,1/144,1/72,1/58,1/18) #frequencies used
+para1 <- lm(log(f_cases) ~ poly(f_tt,3) +as.factor(day) + 
+                  (cos(2*pi*f[1]*f_tt) + sin(2*pi*f[1]*f_tt)) + 
+                  (cos(2*pi*f[2]*f_tt) + sin(2*pi*f[2]*f_tt)) + 
+                  (cos(2*pi*f[3]*f_tt) + sin(2*pi*f[3]*f_tt)) + 
+                  (cos(2*pi*f[4]*f_tt) + sin(2*pi*f[4]*f_tt)) + 
+                  (cos(2*pi*f[5]*f_tt) + sin(2*pi*f[5]*f_tt)))
+
+par(mfrow=c(1,2))
+plot(f_dates,log(f_cases),main='Parametric Model', xaxt="n",type='l', 
+     xlab="", ylab="Transformed Cases")
+lines(f_dates,para1$fitted.values,col='blue',type='l')
+axis.Date(1, at = seq(min(f_dates), max(f_dates), by = "month"),
+          format = "%m/%y", las = 1)
+
+
+
+plot.ts(f_dates,para1$residuals,main="Parametric Residual plot", xaxt="n",type='l', 
+     xlab="",ylab='Residuals')
+axis.Date(1, at = seq(min(f_dates), max(f_dates), by = "month"),
+          format = "%m/%y", las = 1)
+
+```
+
+\begin{align}
+log(\text{cases}_t) &=\, \sum^3_{k=0} \beta_k t^k + \beta_4I_{\text{day of week}_t} + \beta_5cos(2\pi\frac{t}{18}) + \beta_6sin(2\pi\frac{t}{18}) + \beta_7cos(2\pi\frac{t}{58}) + \beta_8sin(2\pi\frac{t}{58}) \notag \\
+&+ \beta_9cos(2\pi\frac{t}{72}) + \beta_{10}sin(2\pi\frac{t}{72}) + \beta_{11}cos(2\pi\frac{t}{96}) + \beta_{12}sin(2\pi\frac{t}{96})  \notag \\
+&+ \beta_{13}cos(2\pi\frac{t}{144}) + \beta_{14}sin(2\pi\frac{t}{144}) \notag\\
+(\#eq:parm)
+\end{align} 
+
+  
+The fit of the parametric model, left plot in Figure 2, has some minute discrepancies, but it overall resembles the transformed data very closely. Observing the residual graph, right plot in Figure 2, the residual time series looks about stationary.  
+     
+  
+### Parametric Signal Model with ARMA(2,2)  
+To diagnose an ARMA model, the Autocorrelation Function (ACF) plot and the Partial Autocorrelation Function (PACF) plot, shown in Figure 3. The PACF has a significant point at lag = 1 and the ACF resembles a sinusoidal decay, not necessarily an exponential decay. The significant PACF lag implies at least an AR(1) will fit, but the sinusoidal decay in the ACF plot also implies an AR model with at least two coefficients with opposite signs. From these observations, it was trial and error to find a p and q that roughly reproduces the same ACF and PACF plots.  
+  
+  
+```{r,include = F,execute=F,echo=F}
+#old work on the model
+
+h <- 40
+
+par(mfrow=c(1,2))
+acf(para1$residuals, main = 'ACF of Parametric Residuals',lag.max=h,ylim=c(-0.5,1))
+pacf(para1$residuals, main = 'PACF of Parametric Residuals',lag.max=h,ylim=c(-0.5,1))
+
+#AR1 <- arima(para1$residuals, order = c(1, 1, 0), method = "CSS-ML")
+#sarima(para1$residuals,p=2,d=0,q=2,P=0,D=0,Q=0,S=0)
+#ARIMA(2,0,2)
+#AIC = -5.34546
+#BIC = -5.266131
+#SARIMA(2,0,2)(0,0,1)7
+#AIC = -5.339327
+#BIC = -5.246777
+#SARIMA(2,0,2)(1,0,0)7
+#AIC = -5.339237
+#BIC = -5.246686
+
+sarima(para1$residuals,p=2,d=0,q=2,P=1,D=0,Q=0,S=7)
+#acf2(para1$residuals,max.lag=h,ylim=c(-1,1))
+
+#sim <- sarima.sim(ar=c(1.8447,-0.8938),d=0,ma=c(-1.2019,0.20191))
+#a <- acf2(sim,max.lag=h,ylim=c(-1,1))
+
+#sim <- sarima.sim(ar=c(1.8443,-0.8945),d=0,ma=c(-1.1991,0.19911),sma=c(0.0383),S=7)
+#a <- acf2(sim,max.lag=h,ylim=c(-1,1))
+
+
+
+
+#para_theory <- sarima.sim(ar=c(1.8424,-0.8926),d=0,ma=c(-1.2017,0.2017),sar=c(-0.5651),D=0,sma=c(0.6166 ),S=7)
+#acf2(para1$residuals,max.lag=h,ylim=c(-1,1))
+#acf2(para_theory,max.lag=h,ylim=c(-1,1))
+
+```
+
+```{r, echo=F, fig.align='center',fig.width=8, fig.height=4, fig.cap = "On the left, ACF of parametric residuals. On the right, PACF plot of the parametric residuals. The black circles and dotted lines represent the confidence interval following an ARMA(2,2) model. The red circles and dotted lines represent the confidence interval following a ARMA(2,2)(1,0)[7]"}
+set.seed(915)
+
+h <- 40
+alp <- 0.5 #alpha
+size <- 0.7 #point size
+
+sim1 <- arma_bootstrap(1000,h,p=c(1.8447,-0.8938),q=c(-1.2019,0.20191))
+
+
+sim2 <- arma_bootstrap(1000,h,p=c(1.8445,-0.8946),q=c(-1.1993,0.19931),P=c(0.0353),S=7)
+
+par(mfrow=c(1,2))
+
+acf(para1$residuals, main = 'ACF of Parametric Residuals',lag.max=h,ylim=c(-0.5,1))
+lines(1:h, sim1$ACF['Lower',],col=rgb(red = 0, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+points(1:h,sim1$ACF['Mean',] ,col=rgb(red = 0, green = 0, blue = 0, alpha = alp),cex = size)
+lines(1:h, sim1$ACF['Upper',],col=rgb(red = 0, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+lines(1:h, sim2$ACF['Lower',],col=rgb(red = 1, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+points(1:h,sim2$ACF['Mean',] ,col=rgb(red = 1, green = 0, blue = 0, alpha = alp),cex = size)
+lines(1:h, sim2$ACF['Upper',],col=rgb(red = 1, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+
+
+pacf(para1$residuals, main = 'PACF of Parametric Residuals',lag.max=h,ylim=c(-0.5,1))
+lines(1:h, sim1$PACF['Lower',],col=rgb(red = 0, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+points(1:h,sim1$PACF['Mean',] ,col=rgb(red = 0, green = 0, blue = 0, alpha = alp),cex = size)
+lines(1:h, sim1$PACF['Upper',],col=rgb(red = 0, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+lines(1:h, sim2$PACF['Lower',],col=rgb(red = 1, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+points(1:h,sim2$PACF['Mean',] ,col=rgb(red = 1, green = 0, blue = 0, alpha = alp),cex = size)
+lines(1:h, sim2$PACF['Upper',],col=rgb(red = 1, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+```
+One chosen model is an ARMA(2,2) and to verify the fit of the model, ACF and PACF values are bootstrapped by generating data 1000 times following the parameters of the chosen model to create a 95% confidence interval using the 25th and 975th percentiles as the bands. The confidence bands are the curving dotted lines and the mean fits are the circles, like what is shown in Figure 3 and these will be referred to as 'CI'. Bootstrapping these plots will be used as a comparison between an approximated theoretical model and the data as a measure of fit.  
+  
+The confidence interval for ARMA(2,2) is shown in black in Figure 3, and in observing the fit, most of the data stay inside the bands with the few bars outside. Since a majority of the bars are stay inside the bands, the fit seems reasonable.  
+  
+  
+### Parametric Signal Model with ARMA(2,2)(1,0)[7]  
+Another model to consider is adding a minor seasonal component to ARMA(2,2), this leads to considering an ARMA(2,2)(1,0)[7]. The fit of the model can be seen as the red bootstrap CI in Figure 3. The coefficient for the seasonal ARMA is considerably smaller than the non seasonal coefficients, so it doesnt have that big of an impact on the model. Observing the ARMA(2,2) CI and ARMA(2,2)(1,0)[7] CI agrees with this as both models are very similar. ARMA(2,2)(1,0)[7] looks to be a reasonable fit.  
+  
+  
+  
+## Differencing Model  
+The PACF plot from the parametric model implies Cases has some kind of autoregression, so a lag 1 difference might be useful. After applying this difference, Cases still shows weekly seasonality, which implies a lag 7 differencing is needed to remove that.  Explicitly, the differencing model is a difference of lag 7 on a difference of lag 1 or weekly differencing + daily differencing. The fit of the differencing model can be observed on the left plot of Figure 4. The differencing model captures a lot of the data, variations between the model and the data is more apparent here than in the parametric model, but overall it seems to fit the data rather closely. 
+
+```{r , include = F,execute=F, echo=F, fig.align='center',fig.width=5, fig.height=3, fig.cap = "Differencing Plot"}
+#df_cases <-diff(diff(diff(log(f_cases),differences=2),lag=43),lag=65)
+df_cases <-diff(diff(diff(log(f_cases),differences=2),lag=39),lag=33)
+plot.ts(f_dates,df_cases,xaxt="n",type='l', 
+        main = TeX('$\\nabla_{39}\\nabla_{33}\\nabla^2$ log(cases_t)'), 
+        xlab="",ylab='Transformed Cases')
+axis.Date(1, at = seq(min(f_dates), max(f_dates), by = "month"),
+          format = "%m/%y", las = 1)
+#periodo <- pgram(df_cases)
+
+
+
+Box.test(df_cases,type='Ljung-Box')
+astsa::acf2(df_cases)
+sarima(df_cases,p=0,d=0,q=0,P=0,D=0,Q=0)
+
+auto.arima(df_cases)
+```
+
+
+ 
+  
+  
+```{r differencing, echo=F, fig.align='center',fig.width=8, fig.height=4, fig.cap = "On the left, differencing model fitted in blue on the transformed data in black. On the right, plot of transformed data after differencing"}
+df_cases<- diff(diff(log(f_cases)),lag=7) #diff(log(f_cases),differences=2) #
+
+par(mfrow=c(1,2))
+
+diff_fit <- fitted_diff(log(f_cases),df_cases,0)
+plot(f_dates,log(f_cases)
+     ,main='Differencing Model', xaxt="n",type='l', 
+     xlab="", ylab="Transformed Cases")
+lines(f_dates,diff_fit,col='blue',type='l')
+axis.Date(1, at = seq(min(f_dates), max(f_dates), by = "month"),
+          format = "%m/%y", las = 1)
+
+
+
+plot.ts(f_dates,df_cases,xaxt="n",type='l', 
+        main = TeX('$\\nabla_{7}\\nabla$ log(Cases_t)'), 
+        xlab="",ylab='Transformed Cases')
+axis.Date(1, at = seq(min(f_dates), max(f_dates), by = "month"),
+          format = "%m/%y", las = 1)
+
+#acf2(df_cases,max.lag=50)
+#Box.test(df_cases,type='Ljung-Box')
+
+
+```
+
+ 
+ 
+### Differencing Model with ARMA(1,1)(0,1)[7]
+The SARIMA models being considered are diagnosed using the ACF and PACF plots in Figure 5. Ignoring lag 0 in the ACF plot, there is a significant bar with a clear cut off at lag 7, this implies there is at least a seasonal MA(1) component. The PACF plot shows seasonal decay, which agrees with the ACF, but this model does not capture this pattern. Through trial and error, the ARMA(1,1)(0,1)[7] model was obtained and fits the model rather closely. The fit of this model can be seen in Figure 5 as the black CI in the ACF and PACF plots. A majority of the data is within the CI bands, so this looks to be a reasonable fit.  
+  
+  
+  
+  
+```{r, echo=F, fig.align='center',fig.width=8, fig.height=4, fig.cap = "On the left, ACF of differencing. On the right, PACF plot of the differencing. The black circles and dotted lines represent the confidence interval following a ARMA(1,1)(0,1)[7] model. The red and dotted lines represent the confidence interval following a ARMA(1,2)(1,1)[7] model."}
+#diff(diff(log(f_cases)),lag=7)
+#SARIMA(1,0,1)(0,0,1)7
+#AIC = -4.83794
+#BIC = -4.770398
+#SARIMA(1,0,2)(1,0,1)7
+#AIC = -4.834443
+#BIC = -4.739884
+
+
+
+#sarima(df_cases,p=1,d=0,q=2,P=1,D=0,Q=1,S=7)
+
+h <- 40
+alp <- 0.6 #alpha
+size <- 0.7 #point size
+
+
+
+#SARIMA(1,0,1)(0,0,1)7
+sim3 <- arma_bootstrap(500,h,p=c(0.9946),d=0,q=c(-0.8510),Q=c(-0.9999),S=7)
+#SARIMA(1,0,2)(1,0,1)7
+sim4 <- arma_bootstrap(500,h,p=c(0.9908),d=0,q=c(-0.9211,0.0882),P=c(0.0433),Q=c(-0.9999),S=7)
+
+par(mfrow=c(1,2))
+acf(df_cases, main = 'ACF of Differencing',lag.max=h,ylim=c(-0.5,1))
+lines(1:h, sim3$ACF['Lower',],col=rgb(red = 0, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+points(1:h,sim3$ACF['Mean',] ,col=rgb(red = 0, green = 0, blue = 0, alpha = alp),cex = size)
+lines(1:h, sim3$ACF['Upper',],col=rgb(red = 0, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+lines(1:h, sim4$ACF['Lower',],col=rgb(red = 1, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+points(1:h,sim4$ACF['Mean',] ,col=rgb(red = 1, green = 0, blue = 0, alpha = alp),cex = size)
+lines(1:h, sim4$ACF['Upper',],col=rgb(red = 1, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+
+
+pacf(df_cases, main = 'PACF of Differencing',lag.max=h,ylim=c(-0.5,1))
+lines(1:h, sim3$PACF['Lower',],col=rgb(red = 0, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+points(1:h,sim3$PACF['Mean',] ,col=rgb(red = 0, green = 0, blue = 0, alpha = alp),cex = size)
+lines(1:h, sim3$PACF['Upper',],col=rgb(red = 0, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+lines(1:h, sim4$PACF['Lower',],col=rgb(red = 1, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+points(1:h,sim4$PACF['Mean',] ,col=rgb(red = 1, green = 0, blue = 0, alpha = alp),cex = size)
+lines(1:h, sim4$PACF['Upper',],col=rgb(red = 1, green = 0, blue = 0, alpha = alp),lty=2,cex = size)
+
+```
+
+
+### Differencing Model with ARMA(1,2)(1,1)[7]  
+An alternative is to consider a slightly more complex model. The ARMA(1,2)(1,1)[7] model was obtained similarly through trial and error based on using seasonal MA(1) as a starting point. While the model is different from the previous model considered, the SAR and one of the MA parts of the model have coefficients close to zero, so the effects of the model are similar. The fit of this model can be seen in the red CI on the ACF and PACF plots in Figure 5. Like the CI for ARMA(1,1)(0,1)[7], the CI here also captures a majority of the data, so this appears to be a good fit. 
+
+
+# Model Comparison  
+
+```{r CV, echo=F,include=F,message=F,error=F}
+
+ahead <- 10 #number of days ahead to forecast
+num <- 19 #number of iterations for CV
+end <- 273 #last day in CV set
+start <- end-num*(ahead+1) #last day in train set
+
+sum_squared_errors <- NULL #c(model1=0,model2=0,model3=0,model4=0)
+for (week2 in 0:(num-1)) {
+train_set <- log(f_cases[1:(start+(ahead+1)*week2)])
+test_set <-  log(f_cases[(start+(ahead+1)*week2+1):(start+(ahead+1)*(week2+1)-1)])
+N = length(train_set)
+#print(paste(week2,'','train: [ 1 :',(start+(ahead+1)*week2),']|test: [',
+ #           (start+(ahead+1)*week2+1),':',(start+(ahead+1)*(week2+1)-1),']'))
+
+#
+x_train = 1:(start+(ahead+1)*week2)
+x_test = (start+(ahead+1)*week2+1):(start+(ahead+1)*(week2+1)-1)
+
+f <- c(1/96,1/144,1/72,1/58,1/18) #frequencies used
+signal1 <- lm(train_set ~ poly(x_train,3) +as.factor(x_train %% 7) + 
+                  (cos(2*pi*f[1]*x_train) + sin(2*pi*f[1]*x_train)) + 
+                  (cos(2*pi*f[2]*x_train) + sin(2*pi*f[2]*x_train)) + 
+                  (cos(2*pi*f[3]*x_train) + sin(2*pi*f[3]*x_train)) + 
+                  (cos(2*pi*f[4]*x_train) + sin(2*pi*f[4]*x_train)) + 
+                  (cos(2*pi*f[5]*x_train) + sin(2*pi*f[5]*x_train)))
+signal.forecast1 <- predict(signal1,newdata=data.frame(x_train=x_test))
+noise.forecast1.1 <- sarima.for(signal1$residuals, n.ahead=ahead,p=2,d=0,q=2,plot=F)$pred #ARMA(2,2) 
+noise.forecast1.2 <- sarima.for(signal1$residuals, n.ahead=ahead,p=2,d=0,q=2,P=1,S=7,plot=F)$pred #ARMA(2,2)(1,0)[7] 
+forecast1.1 <- signal.forecast1 + noise.forecast1.1
+forecast1.2 <- signal.forecast1 + noise.forecast1.2
+
+signal2 <-diff(diff(train_set),lag=7)
+noise.forecast2.1 <- sarima.for(signal2, n.ahead=ahead,p=1,d=0,q=1,P=0,D=0,Q=1,S=7,plot=F)$pred #ARMA(1,1)(0,1)[7]
+noise.forecast2.2 <- sarima.for(signal2, n.ahead=ahead,p=1,d=0,q=2,P=1,D=0,Q=1,S=7,plot=F)$pred #ARMA(1,2)(1,1)[7] 
+
+forecast2.1 = numeric(ahead)
+forecast2.2 = numeric(ahead)
+
+for(i in 1:7){
+          forecast2.1[i] = noise.forecast2.1[i] + train_set[N+i-7]
+                                                + train_set[N+i-1] 
+                                                - train_set[N+i-1-7]
+          forecast2.2[i] = noise.forecast2.2[i] + train_set[N+i-7]
+                                                + train_set[N+i-1] 
+                                                - train_set[N+i-1-7]
+}
+if(ahead >= 8){
+  for(i in 8:ahead){
+          forecast2.1[i] = noise.forecast2.1[i] + forecast2.1[i-7]
+                                                + train_set[N+i-1]
+                                                - train_set[N+i-1-7]
+          forecast2.2[i] = noise.forecast2.2[i] + forecast2.2[i-7]
+                                                + train_set[N+i-1]
+                                                - train_set[N+i-1-7]
+  }
+}
+#
+
+sum_squared_errors = rbind(sum_squared_errors,
+                           cbind(sum((forecast1.1 - test_set)^2),sum((forecast1.2 - test_set)^2),
+                           sum((forecast2.1 - test_set)^2),sum((forecast2.2 - test_set)^2)))
+# sum_squared_errors[1] = sum_squared_errors[1] + sum((forecast1.1 - test_set)^2)
+# sum_squared_errors[2] = sum_squared_errors[2] + sum((forecast1.2 - test_set)^2)
+# sum_squared_errors[3] = sum_squared_errors[3] + sum((forecast2.1 - test_set)^2)
+# sum_squared_errors[4] = sum_squared_errors[4] + sum((forecast2.2 - test_set)^2)
+#print(week2)
+}
+model_rmse <- sqrt(colSums(sum_squared_errors)/(num*ahead))
+
+
+par(mfrow=c(2,2))
+plot(0:(num-1),sqrt(sum_squared_errors[,1]/num),type='l',main='forecast1.1')
+plot(0:(num-1),sqrt(sum_squared_errors[,2]/num),type='l',main='forecast1.2')
+plot(0:(num-1),sqrt(sum_squared_errors[,3]/num),type='l',main='forecast2.1')
+plot(0:(num-1),sqrt(sum_squared_errors[,4]/num),type='l',main='forecast2.2')
+```
+
+To pick a final model for forecasting, each model will be measured using the Root Mean Square Predictive Error (RMSPE) through cross validation. From `r format(f_dates[start],'%B %d, %Y')` to `r format(f_dates[end],'%B %d, %Y')`, Cases cases will be partitioned into `r num` intervals of `r ahead` days. One iteration of cross validation will fit the models and then calculate the Mean Square Root Predictive Error (MSPE) divided by `r num` $\times$ `r ahead` per model, and once every MSPE has been calculated and summed up, a square root is applied to get RMSPE. The best model will be the model with the smallest RMSPE.  
+  
+The aggregated measured RMSPE per model can be seen in Table 1. Weekly differencing + daily differencing + ARMA(1,2)x(1,1)[7] performed overall the best with weekly Differencing + Daily Differencing + ARMA(1,1)x(0,1)[7] as a very close second.  
+  
+
+
+```{r rmsetable, echo=F}
+#RMSE table
+rmse = matrix(model_rmse, nrow=4,ncol = 1)
+colnames(rmse) = c("RMSPE")
+rownames(rmse) = c(
+        "Parametric Model + ARMA(2,2)",
+        "Parametric Model + ARMA(2,2)x(1,0)[7] ",
+        "Weekly Differencing + Daily Differencing + ARMA(1,1)x(0,1)[7]",
+        "Weekly Differencing + Daily Differencing + ARMA(1,2)x(1,1)[7]"
+        )
+knitr::kable(rmse,caption = "Cross Validated RMSPE per considered model.")
+
+start_date <- 120
+last_date <- N+ahead
+plotting_date <- start_date:last_date
+all_dates <- c(f_dates[1:ahead],f_dates+ahead)
+```
+
+# Results  
+The forecasting model selected is weekly differencing + daily differencing + ARMA(1,2)x(1,1)[7]. Let \(log(\text{cases}_t) = Y_t\) be the log transformed number of cases at day t after applying an exponential filter, $X_t$ be a stationary process following ARMA(1,2)x(1,1)[7], and $W_t$ be white noise with variance $\sigma^2_W$. The model can be mathematically described like in Equation \@ref(eq:diff).  
+
+\begin{align}
+Y_t &= \nabla_7\nabla Y_t + X_t \notag \\
+&= Y_{t-1} + Y_{t-7} - Y_{t-8} + \phi_1 X_{t-1} + \Phi_1 X_{t-7} - \phi_1\Phi_1 X_{t-8} \notag \\
+&+ W_t + \theta_1 W_{t-1} + \theta_2 W_{t-2} + \Theta_1 W_{t-7} + \theta_1\Theta_1 W_{t-8} + \theta_2\Theta_1 W_{t-9} \notag \\
+(\#eq:diff)
+\end{align}
+
+The ARMA components in Equation \@ref(eq:diff) can be derived based on the form $(I-\phi_1 B)(I-\Phi_1 B^7)X_t = (I+\theta_1 B+\theta_2 B)(I + \Theta_1 B^7) W_t$, this describes ARMA(1,2)x(1,1)[7] using back-shift notation, where $I$ is the identity operator and $B$ is the back-shift operator. Expanding this form, solving for $X_t$, and substituting $X_t$ is what is given in Equation \@ref(eq:diff). The varables $\phi,\Phi, \theta$, and $\Theta$ are coefficients for the ARMA model.  
+  
+  
+## Estimation of model parameters  
+The estimates of the coefficients can be seen in Table 2. The strongest three coefficients imply a noticeable ARMA(1,1)x(0,1)[7] process, which is the first differencing ARMA model considered, and this makes sense as that model was barely behind ARMA(1,2)x(1,1)[7] when cross validating RMSPE.  
+  
+
+  
+  
+  
+  
+## Prediction  
+
+Figure 6 plots the $\text{Cases}_t$ from `r format(all_dates[start_date],'%B %d, %Y')` to `r format(all_dates[last_date],'%B %d, %Y')` in black and is appended with the forecasts for the next `r ahead` days in red. The forecast predicts that the number of new cases in the next `r ahead` days will have no trend while still showing some seasonality. This implies maintaining the same amount of resources from the last few days to support the new cases before the rate of new cases changes again.   
+
+```{r, echo=F, fig.align='center',fig.width=5, fig.height=3, fig.cap = "Time Series of number of covid cases and the predictions for the next 10 days. In black, the number of covid cases. In red, the forecast for the next 10 days"}
+train_set <- log(f_cases)
+N = length(train_set)
+
+#
+x_train = 1:N
+x_test = N + 0:ahead
+
+
+
+
+signal2 <-diff(diff(train_set),lag=7)
+noise.forecast2.1 <- sarima.for(signal2, n.ahead=(ahead),p=1,d=0,q=1,P=0,D=0,Q=1,S=7,plot=F)$pred #ARMA(1,1)(0,1)[7]
+noise.forecast2.2 <- sarima.for(signal2, n.ahead=(ahead),p=1,d=0,q=2,P=1,D=0,Q=1,S=7,plot=F)$pred #ARMA(1,2)(1,1)[7] 
+
+forecast2.1 = numeric(ahead)
+forecast2.2 = numeric(ahead)
+
+for(i in 1:7){
+          forecast2.1[i] = noise.forecast2.1[i] + train_set[N+i-7]
+                                                + train_set[N+i-1] 
+                                                - train_set[N+i-1-7]
+          forecast2.2[i] = noise.forecast2.2[i] + train_set[N+i-7]
+                                                + train_set[N+i-1] 
+                                                - train_set[N+i-1-7]
+}
+if(ahead >= 8){
+  for(i in 8:ahead){
+          forecast2.1[i] = noise.forecast2.1[i] + forecast2.1[i-7]
+                                                + train_set[N+i-1]
+                                                - train_set[N+i-1-7]
+          forecast2.2[i] = noise.forecast2.2[i] + forecast2.2[i-7] 
+                                                + train_set[N+i-1]
+                                                - train_set[N+i-1-7]
+  }
+}
+# biggest <- exp(max(forecast1.1,forecast1.2,forecast2.1,forecast2.2))
+signal2_fit <- c(fitted_diff(log(f_cases),signal2,0),forecast2.2)
+
+
+
+plot.ts(all_dates[plotting_date],exp(signal2_fit[plotting_date]),type='l',main='Cases Time Series with Forecast',
+        xaxt="n",ylab="Cases",xlab="",xlim = c(all_dates[start_date], max(all_dates)),
+      ylim = c(min(exp(signal2_fit[plotting_date])),max(exp(signal2_fit[plotting_date]))))
+# lines(x_test,exp(forecast2.1),col='blue')
+lines(all_dates[x_test],exp(signal2_fit[x_test]),col='red')
+axis.Date(1, at = seq(min(all_dates), max(all_dates), by = "month"),
+          format = "%m/%y", las = 1)
+
+
+```
+
+ 
+
+\newpage
+# Appendix 1 - Table of Parameter Estimates  
+
+Table 2: Estimated coefficients of model as seen in Equation (2), with their standard errors (SE)  
+  
+|Parameter|Estimate|SE|Coefficient Description|
+|:---------|---:|---:|:---|
+|$\phi_{1}$|0.9908|0.0158|Non-seasonal AR coefficient 1|
+|$\Phi_{1}$|0.0433|0.0651|Seasonal AR coefficient 1|
+|$\theta_{1}$|-0.9211|0.0597|Non-seasonal MA coefficient 1|
+|$\theta_{2}$|0.0882|0.0614|Non-seasonal MA coefficient 2|
+|$\Theta_{1}$|-1.0000 |0.0472|Seasonal MA coefficient 1|
+|$\sigma^2_W$|0.0004058| |Variance of White Noise|
+
+
